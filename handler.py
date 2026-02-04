@@ -1,5 +1,8 @@
 import base64
 import io
+import json
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -92,4 +95,82 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"error": str(exc)}
 
 
-runpod.serverless.start({"handler": handler})
+def _should_use_runpod() -> bool:
+    if os.environ.get("FORCE_RUNPOD_SERVERLESS") == "1":
+        return True
+    if os.environ.get("RUNPOD_SERVERLESS") == "1":
+        return True
+    if os.environ.get("RUNPOD_ENDPOINT_ID"):
+        return True
+    if os.environ.get("RUNPOD_API_KEY"):
+        return True
+    return False
+
+
+def _ensure_test_input() -> None:
+    path = os.environ.get("RUNPOD_TEST_INPUT", "test_input.json")
+    if os.path.exists(path):
+        return
+    img = Image.new("RGB", (1, 1), color=(0, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    payload = {
+        "input": {
+            "image_base64": base64.b64encode(buf.getvalue()).decode("utf-8")
+        }
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+
+class _LocalHandler(BaseHTTPRequestHandler):
+    server_version = "local-age-regressor/1.0"
+
+    def log_message(self, *_args: Any) -> None:
+        return
+
+    def do_GET(self) -> None:
+        if self.path.rstrip("/") == "/health":
+            body = json.dumps({"status": "ok"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_error(404, "Not Found")
+
+    def do_POST(self) -> None:
+        if self.path not in ("/", "/run", "/invocations"):
+            self.send_error(404, "Not Found")
+            return
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
+        try:
+            payload = json.loads(raw.decode("utf-8") or "{}")
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON payload")
+            return
+
+        result = handler(payload)
+        status = 200 if "error" not in result else 400
+        body = json.dumps(result).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _serve_local() -> None:
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+    with HTTPServer((host, port), _LocalHandler) as httpd:
+        httpd.serve_forever()
+
+
+if _should_use_runpod():
+    _ensure_test_input()
+    runpod.serverless.start({"handler": handler})
+else:
+    _serve_local()

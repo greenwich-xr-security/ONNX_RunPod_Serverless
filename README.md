@@ -6,7 +6,6 @@ Run a GPU-backed ONNX EfficientNet V2 M age regressor on RunPod Serverless. The 
 - `v2_m_age_regressor_ddp.onnx`: model (input size 480x480, EfficientNet V2 M)
 - `handler.py`: RunPod serverless handler
 - `Dockerfile`: container build
-- `run_onnx.py`: local CLI for quick sanity checks
 
 ## Input / Output
 
@@ -34,12 +33,12 @@ Build:
 docker build -t onnx-runpod .
 ```
 
-Run (GPU):
+Run (GPU, local HTTP server on `:8000`):
 ```bash
 docker run --gpus all -p 8000:8000 onnx-runpod
 ```
 
-Run (CPU fallback):
+Run (CPU fallback, local HTTP server on `:8000`):
 ```bash
 docker run -p 8000:8000 onnx-runpod
 ```
@@ -75,3 +74,4 @@ Expected output:
 - Preprocessing uses center-crop to square, resize to model input size, and ImageNet mean/std normalization.
 - Output uses `age = mean`, `std = exp(0.5 * log_var)`.
 - The handler supports either two outputs (`mean`, `log_var`) or a single output tensor with at least two values.
+- The container runs a local HTTP server by default. Set `FORCE_RUNPOD_SERVERLESS=1` to force RunPod serverless mode locally.
