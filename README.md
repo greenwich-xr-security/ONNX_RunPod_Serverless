@@ -120,4 +120,6 @@ curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync \
 - `MIN_HAND_DET_CONF`: Minimum detection confidence (default `0.5`).
 - `MIN_HAND_PRESENCE_CONF`: Minimum presence confidence (default `0.5`).
 - `MIN_HAND_TRACKING_CONF`: Minimum tracking confidence (default `0.5`).
+- `SAVE_MASKED_IMAGE=1`: Save the masked RGB image for inspection (overwrites on each request).
+- `SAVE_MASKED_PATH`: Output path for the masked image (default `/app/masked_latest.png`).
 - `FORCE_RUNPOD_SERVERLESS=1`: Force RunPod serverless mode locally.

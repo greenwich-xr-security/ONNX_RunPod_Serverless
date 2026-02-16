@@ -27,3 +27,12 @@ Thumbs.db
 # Local test artifacts
 test.jpg
 *.bin
+
+# Docker build artifacts
+CACHED
+\[auth\]
+\[auth\]/
+\[internal\]
+\[internal\]/
+docker
+docker/

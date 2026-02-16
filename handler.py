@@ -44,6 +44,8 @@ AGE_MODEL_SHA256 = os.environ.get(
     "618a3935d3e5a15c9f7ec3f39fe759b2239497d5184b146a8c55dc6660add395",
 )
 MODEL_DOWNLOAD_TIMEOUT = int(os.environ.get("MODEL_DOWNLOAD_TIMEOUT", "1200"))
+SAVE_MASKED_IMAGE = os.environ.get("SAVE_MASKED_IMAGE", "0") == "1"
+SAVE_MASKED_PATH = os.environ.get("SAVE_MASKED_PATH", "/app/masked_latest.png")
 MAX_HANDS = int(os.environ.get("MAX_HANDS", "2"))
 MIN_HAND_DET_CONF = float(os.environ.get("MIN_HAND_DET_CONF", "0.5"))
 MIN_HAND_PRESENCE_CONF = float(os.environ.get("MIN_HAND_PRESENCE_CONF", "0.5"))
@@ -258,6 +260,13 @@ def _apply_mask(rgb_image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return masked.astype(np.uint8)
 
 
+def _maybe_save_image(image: Image.Image) -> None:
+    if not SAVE_MASKED_IMAGE:
+        return
+    os.makedirs(os.path.dirname(SAVE_MASKED_PATH), exist_ok=True)
+    image.save(SAVE_MASKED_PATH)
+
+
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         session, input_name, input_size = _load_age_model()
@@ -275,6 +284,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             rgb_image = _apply_mask(rgb_image, mask)
 
         masked_img = Image.fromarray(rgb_image)
+        _maybe_save_image(masked_img)
         tensor = _prepare_image(masked_img, input_size)
         outputs = session.run(None, {input_name: tensor})
         mean_val, log_var_val = _extract_mean_logvar(outputs)
