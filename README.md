@@ -66,12 +66,41 @@ Expected output:
 
 ## RunPod Serverless
 
-1. Build and push the image to your registry.
-2. Create a Serverless endpoint in RunPod using the image.
-3. Send the same JSON payload as above.
+1. Create a RunPod Serverless endpoint.
+2. Choose GitHub repository build.
+3. Set `Dockerfile` path to `Dockerfile` and build context to `.`.
+4. Build the image.
+5. Deploy the endpoint.
+
+### RunPod API Test (External)
+
+Create an API key in RunPod Console → Settings → API Keys.
+
+Async (queue-based):
+```bash
+curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/run \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <RUNPOD_API_KEY>" \
+  -d '{"input":{"image_base64":"<BASE64_OR_DATA_URL>"}}'
+```
+
+Check status:
+```bash
+curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/status/<REQUEST_ID> \
+  -H "Authorization: Bearer <RUNPOD_API_KEY>"
+```
+
+Sync (single request):
+```bash
+curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <RUNPOD_API_KEY>" \
+  -d '{"input":{"image_base64":"<BASE64_OR_DATA_URL>"}}'
+```
 
 ## Notes
 - Preprocessing uses center-crop to square, resize to model input size, and ImageNet mean/std normalization.
 - Output uses `age = mean`, `std = exp(0.5 * log_var)`.
 - The handler supports either two outputs (`mean`, `log_var`) or a single output tensor with at least two values.
 - The container runs a local HTTP server by default. Set `FORCE_RUNPOD_SERVERLESS=1` to force RunPod serverless mode locally.
+- The ONNX model is downloaded during build from GitHub Releases to avoid Git LFS issues in build environments.
