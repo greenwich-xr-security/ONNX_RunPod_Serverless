@@ -7,7 +7,6 @@ import os
 import shutil
 import threading
 import time
-import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -69,7 +68,6 @@ MODEL_ASSET_PATTERNS = [
 MODEL_MAX_RELEASES = int(os.environ.get("MODEL_MAX_RELEASES", "0"))
 MODEL_ALLOW_PRERELEASE = os.environ.get("MODEL_ALLOW_PRERELEASE", "1") == "1"
 MODEL_ALLOW_DRAFT = os.environ.get("MODEL_ALLOW_DRAFT", "0") == "1"
-MODEL_SYNC_ON_START = os.environ.get("MODEL_SYNC_ON_START", "1") == "1"
 MODEL_SYNC_MIN_INTERVAL_SEC = int(os.environ.get("MODEL_SYNC_MIN_INTERVAL_SEC", "300"))
 
 SAVE_MASKED_IMAGE = os.environ.get("SAVE_MASKED_IMAGE", "0") == "1"
@@ -341,18 +339,16 @@ def _sync_model_catalog(force: bool = False) -> Dict[str, Any] | None:
     global _MODEL_CATALOG_CACHE, _MODEL_CATALOG_LAST_SYNC
 
     with _MODEL_CATALOG_LOCK:
-        if not force and _MODEL_CATALOG_CACHE is not None:
+        now = time.time()
+        if not force and (now - _MODEL_CATALOG_LAST_SYNC) < MODEL_SYNC_MIN_INTERVAL_SEC:
+            if _MODEL_CATALOG_CACHE is not None:
+                return _MODEL_CATALOG_CACHE
+            _MODEL_CATALOG_CACHE = _read_manifest_from_disk()
             return _MODEL_CATALOG_CACHE
-        if (
-            not force
-            and _MODEL_CATALOG_CACHE is None
-            and (time.time() - _MODEL_CATALOG_LAST_SYNC) < MODEL_SYNC_MIN_INTERVAL_SEC
-        ):
-            return _read_manifest_from_disk()
 
         if not _repo_configured():
             _MODEL_CATALOG_CACHE = _read_manifest_from_disk()
-            _MODEL_CATALOG_LAST_SYNC = time.time()
+            _MODEL_CATALOG_LAST_SYNC = now
             return _MODEL_CATALOG_CACHE
 
         releases = _fetch_releases()
@@ -375,19 +371,27 @@ def _sync_model_catalog(force: bool = False) -> Dict[str, Any] | None:
         }
         _write_manifest(manifest)
         _MODEL_CATALOG_CACHE = manifest
-        _MODEL_CATALOG_LAST_SYNC = time.time()
+        _MODEL_CATALOG_LAST_SYNC = now
         return manifest
 
 
-def _get_catalog() -> Dict[str, Any] | None:
-    catalog = _sync_model_catalog(force=False)
-    if catalog:
-        return catalog
-    return _read_manifest_from_disk()
+def _get_catalog_cached_only() -> Dict[str, Any] | None:
+    global _MODEL_CATALOG_CACHE
+    if _MODEL_CATALOG_CACHE is not None:
+        return _MODEL_CATALOG_CACHE
+    with _MODEL_CATALOG_LOCK:
+        if _MODEL_CATALOG_CACHE is not None:
+            return _MODEL_CATALOG_CACHE
+        _MODEL_CATALOG_CACHE = _read_manifest_from_disk()
+        return _MODEL_CATALOG_CACHE
+
+
+def _get_catalog_with_refresh() -> Dict[str, Any] | None:
+    return _sync_model_catalog(force=False)
 
 
 def _list_models_payload() -> Dict[str, Any]:
-    catalog = _get_catalog()
+    catalog = _get_catalog_with_refresh()
     if not catalog:
         return {"models": [], "repo": None, "synced_at": None}
 
@@ -411,7 +415,7 @@ def _list_models_payload() -> Dict[str, Any]:
 
 
 def _get_model_payload(tag: str) -> Dict[str, Any]:
-    catalog = _get_catalog()
+    catalog = _get_catalog_with_refresh()
     if not catalog:
         raise ValueError("Model catalog is not available.")
     for release in catalog.get("releases", []):
@@ -424,7 +428,7 @@ def _resolve_selected_model(
     model_tag: str | None,
     model_name: str | None,
 ) -> Tuple[str, str | None, str | None]:
-    catalog = _get_catalog()
+    catalog = _get_catalog_cached_only()
     if catalog and catalog.get("releases"):
         releases = catalog["releases"]
         selected_release = releases[0]
@@ -766,19 +770,6 @@ def _serve_local() -> None:
     with HTTPServer((host, port), _LocalHandler) as httpd:
         httpd.serve_forever()
 
-
-def _startup_sync_if_needed() -> None:
-    if not MODEL_SYNC_ON_START:
-        return
-    try:
-        _sync_model_catalog(force=True)
-    except urllib.error.HTTPError as exc:
-        print(f"[startup] model sync failed: HTTP {exc.code} {exc.reason}")
-    except Exception as exc:
-        print(f"[startup] model sync failed: {exc}")
-
-
-_startup_sync_if_needed()
 
 if _should_use_runpod():
     _ensure_test_input()

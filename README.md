@@ -11,6 +11,8 @@ The worker supports:
 - model catalog listing from GitHub Releases (`action=list_models`),
 - model detail lookup (`action=get_model`).
 
+Release sync runs on demand during model-catalog requests, not at worker startup.
+
 ## Files
 - `handler.py`: RunPod serverless handler + local HTTP server
 - `Dockerfile`: container build
@@ -115,8 +117,7 @@ Release sync:
 - `MODEL_MAX_RELEASES`: keep only first N releases from API order (0 = all).
 - `MODEL_ALLOW_PRERELEASE`: include prereleases (`1`/`0`, default `1`).
 - `MODEL_ALLOW_DRAFT`: include draft releases (`1`/`0`, default `0`).
-- `MODEL_SYNC_ON_START`: run release sync on startup (`1`/`0`, default `1`).
-- `MODEL_SYNC_MIN_INTERVAL_SEC`: minimum interval for lazy refresh calls (default `300`).
+- `MODEL_SYNC_MIN_INTERVAL_SEC`: minimum interval between release checks on model-catalog requests (default `300`).
 
 Inference model fallback (legacy):
 - `AGE_MODEL_PATH`: local model path (default `/app/v2_m_age_regressor_ddp.onnx`).
