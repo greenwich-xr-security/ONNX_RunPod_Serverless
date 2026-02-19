@@ -71,8 +71,6 @@ MODEL_ALLOW_PRERELEASE = os.environ.get("MODEL_ALLOW_PRERELEASE", "1") == "1"
 MODEL_ALLOW_DRAFT = os.environ.get("MODEL_ALLOW_DRAFT", "0") == "1"
 MODEL_SYNC_MIN_INTERVAL_SEC = int(os.environ.get("MODEL_SYNC_MIN_INTERVAL_SEC", "300"))
 
-SAVE_MASKED_IMAGE = os.environ.get("SAVE_MASKED_IMAGE", "0") == "1"
-SAVE_MASKED_PATH = os.environ.get("SAVE_MASKED_PATH", "/app/masked_latest.png")
 SAVE_INFERENCE_LOGS = os.environ.get("SAVE_INFERENCE_LOGS", "0") == "1"
 INFERENCE_LOG_MAX_ITEMS = int(os.environ.get("INFERENCE_LOG_MAX_ITEMS", "100"))
 INFERENCE_LOG_DIR = os.environ.get("INFERENCE_LOG_DIR", "/app/inference_logs")
@@ -779,13 +777,6 @@ def _apply_mask(rgb_image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return masked.astype(np.uint8)
 
 
-def _maybe_save_image(image: Image.Image) -> None:
-    if not SAVE_MASKED_IMAGE:
-        return
-    _mkdir_for_file(SAVE_MASKED_PATH)
-    image.save(SAVE_MASKED_PATH)
-
-
 def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
     model_tag = job_input.get("model_tag")
     model_name = job_input.get("model_name")
@@ -816,13 +807,12 @@ def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
             rgb_image = _apply_mask(rgb_image, mask)
 
     masked_img = Image.fromarray(rgb_image)
-    _maybe_save_image(masked_img)
     tensor = _prepare_image(masked_img, input_size)
     outputs = session.run(None, {input_name: tensor})
     mean_val, log_var_val = _extract_mean_logvar(outputs)
     std_val = float(np.exp(0.5 * log_var_val))
     inference_id = _save_inference_log(
-        img=img,
+        img=masked_img,
         model_tag=selected_tag,
         model_name=selected_model_name,
         age=mean_val,

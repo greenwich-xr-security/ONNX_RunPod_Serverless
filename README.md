@@ -28,12 +28,12 @@ In release-sync mode, source code archives are not downloaded because the worker
 
 Build:
 ```bash
-docker build -t hand-segmentation-runpod .
+docker build -t age-inference-runpod .
 ```
 
 Build (legacy pre-bake models into image):
 ```bash
-docker build -t hand-segmentation-runpod --build-arg DOWNLOAD_MODELS=1 .
+docker build -t age-inference-runpod --build-arg DOWNLOAD_MODELS=1 .
 ```
 
 Run with release-sync mode:
@@ -42,7 +42,7 @@ docker run --gpus all -p 8000:8000 \
   -e MODEL_REPO_OWNER=<OWNER> \
   -e MODEL_REPO_NAME=<REPO> \
   -e GITHUB_TOKEN=<TOKEN_IF_PRIVATE> \
-  hand-segmentation-runpod
+  age-inference-runpod
 ```
 
 ## Local HTTP API
