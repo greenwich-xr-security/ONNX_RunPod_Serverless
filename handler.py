@@ -1,10 +1,15 @@
 import base64
+import fnmatch
 import hashlib
 import io
 import json
 import os
 import shutil
+import threading
+import time
+import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Tuple
 
@@ -32,9 +37,7 @@ MOBILE_SAM_URL = os.environ.get(
     "MOBILE_SAM_URL",
     "https://raw.githubusercontent.com/ChaoningZhang/MobileSAM/master/weights/mobile_sam.pt",
 )
-AGE_MODEL_PATH = os.environ.get(
-    "AGE_MODEL_PATH", "/app/v2_m_age_regressor_ddp.onnx"
-)
+AGE_MODEL_PATH = os.environ.get("AGE_MODEL_PATH", "/app/v2_m_age_regressor_ddp.onnx")
 AGE_MODEL_URL = os.environ.get(
     "AGE_MODEL_URL",
     "https://github.com/greenwich-xr-security/ONNX_RunPod_Serverless/releases/download/1/v2_m_age_regressor_ddp.onnx",
@@ -44,6 +47,31 @@ AGE_MODEL_SHA256 = os.environ.get(
     "618a3935d3e5a15c9f7ec3f39fe759b2239497d5184b146a8c55dc6660add395",
 )
 MODEL_DOWNLOAD_TIMEOUT = int(os.environ.get("MODEL_DOWNLOAD_TIMEOUT", "1200"))
+
+MODEL_REPO = os.environ.get("MODEL_REPO", "").strip()
+MODEL_REPO_OWNER = os.environ.get("MODEL_REPO_OWNER", "").strip()
+MODEL_REPO_NAME = os.environ.get("MODEL_REPO_NAME", "").strip()
+if MODEL_REPO and not (MODEL_REPO_OWNER and MODEL_REPO_NAME):
+    parts = MODEL_REPO.split("/", 1)
+    if len(parts) == 2:
+        MODEL_REPO_OWNER, MODEL_REPO_NAME = parts[0].strip(), parts[1].strip()
+
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+MODEL_STORE_DIR = os.environ.get("MODEL_STORE_DIR", "/app/models")
+MODEL_MANIFEST_PATH = os.path.join(MODEL_STORE_DIR, "manifest.json")
+MODEL_ASSET_PATTERNS = [
+    p.strip()
+    for p in os.environ.get(
+        "MODEL_ASSET_PATTERNS", "*.onnx,*.sha256,model_card.md,deployment_sheet.json"
+    ).split(",")
+    if p.strip()
+]
+MODEL_MAX_RELEASES = int(os.environ.get("MODEL_MAX_RELEASES", "0"))
+MODEL_ALLOW_PRERELEASE = os.environ.get("MODEL_ALLOW_PRERELEASE", "1") == "1"
+MODEL_ALLOW_DRAFT = os.environ.get("MODEL_ALLOW_DRAFT", "0") == "1"
+MODEL_SYNC_ON_START = os.environ.get("MODEL_SYNC_ON_START", "1") == "1"
+MODEL_SYNC_MIN_INTERVAL_SEC = int(os.environ.get("MODEL_SYNC_MIN_INTERVAL_SEC", "300"))
+
 SAVE_MASKED_IMAGE = os.environ.get("SAVE_MASKED_IMAGE", "0") == "1"
 SAVE_MASKED_PATH = os.environ.get("SAVE_MASKED_PATH", "/app/masked_latest.png")
 MAX_HANDS = int(os.environ.get("MAX_HANDS", "2"))
@@ -54,13 +82,28 @@ MIN_HAND_TRACKING_CONF = float(os.environ.get("MIN_HAND_TRACKING_CONF", "0.5"))
 _HAND_LANDMARKER: vision.HandLandmarker | None = None
 _SAM_PREDICTOR: SamPredictor | None = None
 _DEVICE: str | None = None
-_SESSION: ort.InferenceSession | None = None
-_INPUT_NAME: str | None = None
-_INPUT_SIZE: int | None = None
+
+_MODEL_SESSION_CACHE: Dict[str, Tuple[ort.InferenceSession, str, int]] = {}
+_MODEL_SESSION_LOCK = threading.Lock()
+
+_MODEL_CATALOG_CACHE: Dict[str, Any] | None = None
+_MODEL_CATALOG_LOCK = threading.Lock()
+_MODEL_CATALOG_LAST_SYNC = 0.0
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 DEFAULT_INPUT_SIZE = 480
+GITHUB_API_BASE = "https://api.github.com"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _mkdir_for_file(path: str) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
 
 
 def _get_running_mode() -> Any:
@@ -71,29 +114,353 @@ def _get_running_mode() -> Any:
     raise RuntimeError("Unsupported mediapipe vision running mode.")
 
 
-def _ensure_file(path: str, url: str, sha256: str | None = None) -> None:
-    if os.path.exists(path):
-        return
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def _http_headers(include_github_json_accept: bool = False) -> Dict[str, str]:
+    headers = {"User-Agent": "onnx-runpod-serverless"}
+    if include_github_json_accept:
+        headers["Accept"] = "application/vnd.github+json"
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
+
+
+def _download_to_path(path: str, url: str, headers: Dict[str, str] | None = None) -> None:
+    _mkdir_for_file(path)
     tmp_path = f"{path}.tmp"
+    req = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(url, timeout=MODEL_DOWNLOAD_TIMEOUT) as response:
+        with urllib.request.urlopen(req, timeout=MODEL_DOWNLOAD_TIMEOUT) as response:
             with open(tmp_path, "wb") as handle:
                 shutil.copyfileobj(response, handle)
-        if sha256:
-            hasher = hashlib.sha256()
-            with open(tmp_path, "rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    hasher.update(chunk)
-            digest = hasher.hexdigest()
-            if digest.lower() != sha256.lower():
-                raise RuntimeError(
-                    f"SHA256 mismatch for {path}: expected {sha256}, got {digest}"
-                )
         os.replace(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def _sha256_file(path: str) -> str:
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _ensure_file(
+    path: str,
+    url: str,
+    sha256: str | None = None,
+    headers: Dict[str, str] | None = None,
+) -> None:
+    if os.path.exists(path):
+        return
+    _download_to_path(path, url, headers=headers)
+    if sha256:
+        digest = _sha256_file(path)
+        if digest.lower() != sha256.lower():
+            raise RuntimeError(
+                f"SHA256 mismatch for {path}: expected {sha256}, got {digest}"
+            )
+
+
+def _http_get_json(url: str, headers: Dict[str, str]) -> Any:
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=MODEL_DOWNLOAD_TIMEOUT) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _repo_configured() -> bool:
+    return bool(MODEL_REPO_OWNER and MODEL_REPO_NAME)
+
+
+def _release_dir(tag: str) -> str:
+    safe_tag = tag.replace("/", "_")
+    return os.path.join(MODEL_STORE_DIR, safe_tag)
+
+
+def _asset_selected(name: str) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in MODEL_ASSET_PATTERNS)
+
+
+def _parse_sha256_file(path: str) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    base_name = os.path.basename(path)
+    fallback_name = base_name[:-7] if base_name.endswith(".sha256") else ""
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            digest = parts[0]
+            name = fallback_name
+            if len(parts) >= 2:
+                name = parts[-1].lstrip("*")
+            if name:
+                mapping[os.path.basename(name)] = digest
+    return mapping
+
+
+def _read_text_if_exists(path: str) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _read_json_if_exists(path: str) -> Any:
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _read_manifest_from_disk() -> Dict[str, Any] | None:
+    if not os.path.exists(MODEL_MANIFEST_PATH):
+        return None
+    with open(MODEL_MANIFEST_PATH, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _write_manifest(manifest: Dict[str, Any]) -> None:
+    _mkdir_for_file(MODEL_MANIFEST_PATH)
+    tmp_path = f"{MODEL_MANIFEST_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2)
+    os.replace(tmp_path, MODEL_MANIFEST_PATH)
+
+
+def _fetch_releases() -> List[Dict[str, Any]]:
+    if not _repo_configured():
+        return []
+    headers = _http_headers(include_github_json_accept=True)
+    releases: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        url = (
+            f"{GITHUB_API_BASE}/repos/{MODEL_REPO_OWNER}/{MODEL_REPO_NAME}/releases"
+            f"?per_page=100&page={page}"
+        )
+        batch = _http_get_json(url, headers)
+        if not batch:
+            break
+        releases.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return releases
+
+
+def _sync_release_assets(release: Dict[str, Any]) -> Dict[str, Any] | None:
+    tag = release.get("tag_name") or ""
+    if not tag:
+        return None
+    if release.get("draft") and not MODEL_ALLOW_DRAFT:
+        return None
+    if release.get("prerelease") and not MODEL_ALLOW_PRERELEASE:
+        return None
+
+    assets = release.get("assets") or []
+    release_path = _release_dir(tag)
+    os.makedirs(release_path, exist_ok=True)
+
+    kept_assets: List[Dict[str, Any]] = []
+    for asset in assets:
+        name = asset.get("name") or ""
+        url = asset.get("browser_download_url") or ""
+        if not name or not url or not _asset_selected(name):
+            continue
+        local_path = os.path.join(release_path, name)
+        if not os.path.exists(local_path):
+            _download_to_path(local_path, url, headers=_http_headers())
+        kept_assets.append(
+            {
+                "name": name,
+                "size": int(asset.get("size") or 0),
+                "content_type": asset.get("content_type"),
+                "url": url,
+                "path": local_path,
+            }
+        )
+
+    sha_map: Dict[str, str] = {}
+    for item in kept_assets:
+        if item["name"].endswith(".sha256") and os.path.exists(item["path"]):
+            sha_map.update(_parse_sha256_file(item["path"]))
+
+    models: List[Dict[str, Any]] = []
+    for item in kept_assets:
+        if not item["name"].endswith(".onnx"):
+            continue
+        local_path = item["path"]
+        digest = _sha256_file(local_path)
+        expected = sha_map.get(item["name"])
+        if expected and digest.lower() != expected.lower():
+            raise RuntimeError(
+                f"SHA256 mismatch for {item['name']} in release {tag}: expected {expected}, got {digest}"
+            )
+        models.append(
+            {
+                "name": item["name"],
+                "path": local_path,
+                "size": item["size"],
+                "sha256": digest,
+            }
+        )
+
+    model_card_path = ""
+    deployment_sheet_path = ""
+    for item in kept_assets:
+        lowered = item["name"].lower()
+        if lowered == "model_card.md":
+            model_card_path = item["path"]
+        if lowered == "deployment_sheet.json":
+            deployment_sheet_path = item["path"]
+
+    model_card = _read_text_if_exists(model_card_path)
+    deployment_sheet = _read_json_if_exists(deployment_sheet_path)
+
+    return {
+        "tag": tag,
+        "name": release.get("name") or tag,
+        "body": release.get("body") or "",
+        "published_at": release.get("published_at"),
+        "created_at": release.get("created_at"),
+        "prerelease": bool(release.get("prerelease")),
+        "draft": bool(release.get("draft")),
+        "models": models,
+        "assets": kept_assets,
+        "model_card_path": model_card_path or None,
+        "deployment_sheet_path": deployment_sheet_path or None,
+        "model_card": model_card,
+        "deployment_sheet": deployment_sheet,
+    }
+
+
+def _sync_model_catalog(force: bool = False) -> Dict[str, Any] | None:
+    global _MODEL_CATALOG_CACHE, _MODEL_CATALOG_LAST_SYNC
+
+    with _MODEL_CATALOG_LOCK:
+        if not force and _MODEL_CATALOG_CACHE is not None:
+            return _MODEL_CATALOG_CACHE
+        if (
+            not force
+            and _MODEL_CATALOG_CACHE is None
+            and (time.time() - _MODEL_CATALOG_LAST_SYNC) < MODEL_SYNC_MIN_INTERVAL_SEC
+        ):
+            return _read_manifest_from_disk()
+
+        if not _repo_configured():
+            _MODEL_CATALOG_CACHE = _read_manifest_from_disk()
+            _MODEL_CATALOG_LAST_SYNC = time.time()
+            return _MODEL_CATALOG_CACHE
+
+        releases = _fetch_releases()
+        synced: List[Dict[str, Any]] = []
+        for release in releases:
+            entry = _sync_release_assets(release)
+            if entry is None:
+                continue
+            if entry["models"]:
+                synced.append(entry)
+
+        if MODEL_MAX_RELEASES > 0:
+            synced = synced[:MODEL_MAX_RELEASES]
+
+        manifest = {
+            "repo": f"{MODEL_REPO_OWNER}/{MODEL_REPO_NAME}",
+            "synced_at": _now_iso(),
+            "releases": synced,
+            "default_tag": synced[0]["tag"] if synced else None,
+        }
+        _write_manifest(manifest)
+        _MODEL_CATALOG_CACHE = manifest
+        _MODEL_CATALOG_LAST_SYNC = time.time()
+        return manifest
+
+
+def _get_catalog() -> Dict[str, Any] | None:
+    catalog = _sync_model_catalog(force=False)
+    if catalog:
+        return catalog
+    return _read_manifest_from_disk()
+
+
+def _list_models_payload() -> Dict[str, Any]:
+    catalog = _get_catalog()
+    if not catalog:
+        return {"models": [], "repo": None, "synced_at": None}
+
+    models: List[Dict[str, Any]] = []
+    for release in catalog.get("releases", []):
+        models.append(
+            {
+                "tag": release.get("tag"),
+                "name": release.get("name"),
+                "published_at": release.get("published_at"),
+                "model_count": len(release.get("models") or []),
+                "models": [m.get("name") for m in release.get("models") or []],
+            }
+        )
+    return {
+        "repo": catalog.get("repo"),
+        "synced_at": catalog.get("synced_at"),
+        "default_tag": catalog.get("default_tag"),
+        "models": models,
+    }
+
+
+def _get_model_payload(tag: str) -> Dict[str, Any]:
+    catalog = _get_catalog()
+    if not catalog:
+        raise ValueError("Model catalog is not available.")
+    for release in catalog.get("releases", []):
+        if release.get("tag") == tag:
+            return release
+    raise ValueError(f"Unknown model tag: {tag}")
+
+
+def _resolve_selected_model(
+    model_tag: str | None,
+    model_name: str | None,
+) -> Tuple[str, str | None, str | None]:
+    catalog = _get_catalog()
+    if catalog and catalog.get("releases"):
+        releases = catalog["releases"]
+        selected_release = releases[0]
+        if model_tag and model_tag.lower() != "latest":
+            selected_release = next(
+                (release for release in releases if release.get("tag") == model_tag), None
+            )
+            if selected_release is None:
+                raise ValueError(f"Unknown model_tag: {model_tag}")
+
+        selected_model = None
+        for model in selected_release.get("models") or []:
+            if not model_name or model.get("name") == model_name:
+                selected_model = model
+                break
+        if selected_model is None:
+            if model_name:
+                raise ValueError(
+                    f"Model '{model_name}' not found in release '{selected_release.get('tag')}'"
+                )
+            raise ValueError(f"No model assets found in release '{selected_release.get('tag')}'")
+
+        return (
+            selected_model["path"],
+            selected_release.get("tag"),
+            selected_model.get("name"),
+        )
+
+    if not os.path.exists(AGE_MODEL_PATH):
+        _ensure_file(
+            AGE_MODEL_PATH,
+            AGE_MODEL_URL,
+            AGE_MODEL_SHA256,
+            headers=_http_headers(),
+        )
+    return AGE_MODEL_PATH, None, os.path.basename(AGE_MODEL_PATH)
 
 
 def _load_hand_landmarker() -> vision.HandLandmarker:
@@ -134,16 +501,18 @@ def _infer_img_size(session: ort.InferenceSession) -> int | None:
     return None
 
 
-def _load_age_model() -> Tuple[ort.InferenceSession, str, int]:
-    global _SESSION, _INPUT_NAME, _INPUT_SIZE
-    if _SESSION is None:
-        if not os.path.exists(AGE_MODEL_PATH):
-            _ensure_file(AGE_MODEL_PATH, AGE_MODEL_URL, AGE_MODEL_SHA256)
+def _load_age_model(model_path: str) -> Tuple[ort.InferenceSession, str, int]:
+    with _MODEL_SESSION_LOCK:
+        cached = _MODEL_SESSION_CACHE.get(model_path)
+        if cached is not None:
+            return cached
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        _SESSION = ort.InferenceSession(AGE_MODEL_PATH, providers=providers)
-        _INPUT_NAME = _SESSION.get_inputs()[0].name
-        _INPUT_SIZE = _infer_img_size(_SESSION) or DEFAULT_INPUT_SIZE
-    return _SESSION, _INPUT_NAME, _INPUT_SIZE
+        session = ort.InferenceSession(model_path, providers=providers)
+        input_name = session.get_inputs()[0].name
+        input_size = _infer_img_size(session) or DEFAULT_INPUT_SIZE
+        data = (session, input_name, input_size)
+        _MODEL_SESSION_CACHE[model_path] = data
+        return data
 
 
 def _decode_image(job_input: Dict[str, Any]) -> Image.Image:
@@ -210,9 +579,7 @@ def _extract_hands(
                 handedness = handed.category_name
                 score = float(handed.score)
 
-        hands.append(
-            {"points": points, "handedness": handedness, "score": score}
-        )
+        hands.append({"points": points, "handedness": handedness, "score": score})
     return hands
 
 
@@ -263,33 +630,59 @@ def _apply_mask(rgb_image: np.ndarray, mask: np.ndarray) -> np.ndarray:
 def _maybe_save_image(image: Image.Image) -> None:
     if not SAVE_MASKED_IMAGE:
         return
-    os.makedirs(os.path.dirname(SAVE_MASKED_PATH), exist_ok=True)
+    _mkdir_for_file(SAVE_MASKED_PATH)
     image.save(SAVE_MASKED_PATH)
+
+
+def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
+    model_tag = job_input.get("model_tag")
+    model_name = job_input.get("model_name")
+    model_path, selected_tag, selected_model_name = _resolve_selected_model(
+        model_tag=model_tag,
+        model_name=model_name,
+    )
+
+    session, input_name, input_size = _load_age_model(model_path)
+    img = _decode_image(job_input)
+    rgb_image = np.array(img)
+
+    landmarker = _load_hand_landmarker()
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+    result = landmarker.detect(mp_image)
+    hands = _extract_hands(result, img.width, img.height)
+
+    mask = _segment_hands(rgb_image, hands)
+    if hands and np.any(mask):
+        rgb_image = _apply_mask(rgb_image, mask)
+
+    masked_img = Image.fromarray(rgb_image)
+    _maybe_save_image(masked_img)
+    tensor = _prepare_image(masked_img, input_size)
+    outputs = session.run(None, {input_name: tensor})
+    mean_val, log_var_val = _extract_mean_logvar(outputs)
+    std_val = float(np.exp(0.5 * log_var_val))
+    return {
+        "age": mean_val,
+        "std": std_val,
+        "model_tag": selected_tag,
+        "model_name": selected_model_name,
+    }
 
 
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        session, input_name, input_size = _load_age_model()
         job_input = job.get("input", {})
-        img = _decode_image(job_input)
-        rgb_image = np.array(img)
+        action = str(job_input.get("action", "infer")).lower()
 
-        landmarker = _load_hand_landmarker()
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-        result = landmarker.detect(mp_image)
-        hands = _extract_hands(result, img.width, img.height)
+        if action == "list_models":
+            return _list_models_payload()
+        if action == "get_model":
+            tag = str(job_input.get("model_tag", "")).strip()
+            if not tag:
+                raise ValueError("Missing required field: model_tag")
+            return _get_model_payload(tag)
 
-        mask = _segment_hands(rgb_image, hands)
-        if hands and np.any(mask):
-            rgb_image = _apply_mask(rgb_image, mask)
-
-        masked_img = Image.fromarray(rgb_image)
-        _maybe_save_image(masked_img)
-        tensor = _prepare_image(masked_img, input_size)
-        outputs = session.run(None, {input_name: tensor})
-        mean_val, log_var_val = _extract_mean_logvar(outputs)
-        std_val = float(np.exp(0.5 * log_var_val))
-        return {"age": mean_val, "std": std_val}
+        return _run_inference(job_input)
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -319,19 +712,34 @@ def _ensure_test_input() -> None:
 
 
 class _LocalHandler(BaseHTTPRequestHandler):
-    server_version = "local-age-regressor/2.0"
+    server_version = "local-age-regressor/3.0"
 
     def log_message(self, *_args: Any) -> None:
         return
 
+    def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
-        if self.path.rstrip("/") == "/health":
-            body = json.dumps({"status": "ok"}).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        path = self.path.rstrip("/")
+        if path == "/health":
+            self._send_json(200, {"status": "ok"})
+            return
+        if path == "/models":
+            self._send_json(200, _list_models_payload())
+            return
+        if path.startswith("/models/"):
+            tag = path.split("/", 2)[-1]
+            try:
+                payload = _get_model_payload(tag)
+                self._send_json(200, payload)
+            except Exception as exc:
+                self._send_json(404, {"error": str(exc)})
             return
         self.send_error(404, "Not Found")
 
@@ -349,12 +757,7 @@ class _LocalHandler(BaseHTTPRequestHandler):
 
         result = handler(payload)
         status = 200 if "error" not in result else 400
-        body = json.dumps(result).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_json(status, result)
 
 
 def _serve_local() -> None:
@@ -363,6 +766,19 @@ def _serve_local() -> None:
     with HTTPServer((host, port), _LocalHandler) as httpd:
         httpd.serve_forever()
 
+
+def _startup_sync_if_needed() -> None:
+    if not MODEL_SYNC_ON_START:
+        return
+    try:
+        _sync_model_catalog(force=True)
+    except urllib.error.HTTPError as exc:
+        print(f"[startup] model sync failed: HTTP {exc.code} {exc.reason}")
+    except Exception as exc:
+        print(f"[startup] model sync failed: {exc}")
+
+
+_startup_sync_if_needed()
 
 if _should_use_runpod():
     _ensure_test_input()
