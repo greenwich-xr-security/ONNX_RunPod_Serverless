@@ -9,7 +9,8 @@ Run a GPU-backed pipeline that:
 The worker supports:
 - inference (`action=infer`, default),
 - model catalog listing from GitHub Releases (`action=list_models`),
-- model detail lookup (`action=get_model`).
+- model detail lookup (`action=get_model`),
+- bounded inference log storage/listing (`action=list_inference_logs`, `action=get_inference_log`).
 
 Release sync runs on demand during model-catalog requests, not at worker startup.
 
@@ -75,6 +76,21 @@ curl -s -X POST http://localhost:8000/ \
   -d '{"input":{"image_base64":"<BASE64_OR_DATA_URL>","model_tag":"v2_m"}}'
 ```
 
+List saved inference logs:
+```bash
+curl -s http://localhost:8000/inference-logs
+```
+
+Get one saved inference log:
+```bash
+curl -s http://localhost:8000/inference-logs/<INFERENCE_ID>
+```
+
+Get saved input image:
+```bash
+curl -s http://localhost:8000/inference-logs/<INFERENCE_ID>/image --output input.jpg
+```
+
 ## RunPod API Usage
 
 List models:
@@ -99,6 +115,22 @@ curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <RUNPOD_API_KEY>" \
   -d '{"input":{"image_base64":"<BASE64_OR_DATA_URL>","model_tag":"v2_m"}}'
+```
+
+List saved inference logs:
+```bash
+curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <RUNPOD_API_KEY>" \
+  -d '{"input":{"action":"list_inference_logs","limit":100}}'
+```
+
+Get one saved inference log (include input image as base64):
+```bash
+curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <RUNPOD_API_KEY>" \
+  -d '{"input":{"action":"get_inference_log","inference_id":"<ID>","include_image":true}}'
 ```
 
 ## Configuration
@@ -135,3 +167,9 @@ Segmentation stack:
 - `MIN_HAND_TRACKING_CONF`: minimum tracking confidence (default `0.5`).
 - `SAVE_MASKED_IMAGE=1`: save masked image (overwrites each request).
 - `SAVE_MASKED_PATH`: path for masked image.
+
+Inference logs:
+- `SAVE_INFERENCE_LOGS=1`: enable saving inference input/output pairs.
+- `INFERENCE_LOG_MAX_ITEMS`: max saved pairs, oldest deleted first (default `100`).
+- `INFERENCE_LOG_DIR`: directory for inference logs (default `/app/inference_logs`).
+- `INFERENCE_LOG_JPEG_QUALITY`: JPEG quality for saved inputs (default `90`).

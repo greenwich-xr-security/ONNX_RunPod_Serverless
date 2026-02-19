@@ -8,6 +8,7 @@ import shutil
 import threading
 import time
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Tuple
@@ -72,6 +73,10 @@ MODEL_SYNC_MIN_INTERVAL_SEC = int(os.environ.get("MODEL_SYNC_MIN_INTERVAL_SEC", 
 
 SAVE_MASKED_IMAGE = os.environ.get("SAVE_MASKED_IMAGE", "0") == "1"
 SAVE_MASKED_PATH = os.environ.get("SAVE_MASKED_PATH", "/app/masked_latest.png")
+SAVE_INFERENCE_LOGS = os.environ.get("SAVE_INFERENCE_LOGS", "0") == "1"
+INFERENCE_LOG_MAX_ITEMS = int(os.environ.get("INFERENCE_LOG_MAX_ITEMS", "100"))
+INFERENCE_LOG_DIR = os.environ.get("INFERENCE_LOG_DIR", "/app/inference_logs")
+INFERENCE_LOG_JPEG_QUALITY = int(os.environ.get("INFERENCE_LOG_JPEG_QUALITY", "90"))
 MAX_HANDS = int(os.environ.get("MAX_HANDS", "2"))
 MIN_HAND_DET_CONF = float(os.environ.get("MIN_HAND_DET_CONF", "0.5"))
 MIN_HAND_PRESENCE_CONF = float(os.environ.get("MIN_HAND_PRESENCE_CONF", "0.5"))
@@ -87,11 +92,13 @@ _MODEL_SESSION_LOCK = threading.Lock()
 _MODEL_CATALOG_CACHE: Dict[str, Any] | None = None
 _MODEL_CATALOG_LOCK = threading.Lock()
 _MODEL_CATALOG_LAST_SYNC = 0.0
+_INFERENCE_LOG_LOCK = threading.Lock()
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 DEFAULT_INPUT_SIZE = 480
 GITHUB_API_BASE = "https://api.github.com"
+INFERENCE_LOG_INDEX_PATH = os.path.join(INFERENCE_LOG_DIR, "index.json")
 
 
 def _now_iso() -> str:
@@ -226,6 +233,131 @@ def _write_manifest(manifest: Dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2)
     os.replace(tmp_path, MODEL_MANIFEST_PATH)
+
+
+def _read_inference_log_index() -> Dict[str, Any]:
+    if not os.path.exists(INFERENCE_LOG_INDEX_PATH):
+        return {"items": []}
+    with open(INFERENCE_LOG_INDEX_PATH, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        return {"items": []}
+    items = data.get("items")
+    if not isinstance(items, list):
+        return {"items": []}
+    return {"items": [str(item) for item in items]}
+
+
+def _write_inference_log_index(index: Dict[str, Any]) -> None:
+    _mkdir_for_file(INFERENCE_LOG_INDEX_PATH)
+    tmp_path = f"{INFERENCE_LOG_INDEX_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(index, handle, indent=2)
+    os.replace(tmp_path, INFERENCE_LOG_INDEX_PATH)
+
+
+def _inference_log_paths(inference_id: str) -> Tuple[str, str]:
+    image_path = os.path.join(INFERENCE_LOG_DIR, f"{inference_id}.jpg")
+    meta_path = os.path.join(INFERENCE_LOG_DIR, f"{inference_id}.json")
+    return image_path, meta_path
+
+
+def _save_inference_log(
+    img: Image.Image,
+    model_tag: str | None,
+    model_name: str | None,
+    age: float,
+    std: float,
+) -> str | None:
+    if not SAVE_INFERENCE_LOGS:
+        return None
+    inference_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    image_path, meta_path = _inference_log_paths(inference_id)
+    metadata = {
+        "id": inference_id,
+        "created_at": _now_iso(),
+        "model_tag": model_tag,
+        "model_name": model_name,
+        "age": age,
+        "std": std,
+        "image_path": image_path,
+        "metadata_path": meta_path,
+    }
+
+    with _INFERENCE_LOG_LOCK:
+        os.makedirs(INFERENCE_LOG_DIR, exist_ok=True)
+        img.convert("RGB").save(image_path, format="JPEG", quality=INFERENCE_LOG_JPEG_QUALITY)
+        with open(meta_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+
+        index = _read_inference_log_index()
+        items = [inference_id] + [item for item in index["items"] if item != inference_id]
+
+        max_items = max(1, INFERENCE_LOG_MAX_ITEMS)
+        stale_ids = items[max_items:]
+        for stale_id in stale_ids:
+            stale_image_path, stale_meta_path = _inference_log_paths(stale_id)
+            if os.path.exists(stale_image_path):
+                os.remove(stale_image_path)
+            if os.path.exists(stale_meta_path):
+                os.remove(stale_meta_path)
+        index["items"] = items[:max_items]
+        _write_inference_log_index(index)
+    return inference_id
+
+
+def _read_inference_log_metadata(inference_id: str) -> Dict[str, Any]:
+    _image_path, meta_path = _inference_log_paths(inference_id)
+    if not os.path.exists(meta_path):
+        raise ValueError(f"Unknown inference_id: {inference_id}")
+    with open(meta_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _list_inference_logs_payload(limit: int | None = None) -> Dict[str, Any]:
+    if not SAVE_INFERENCE_LOGS:
+        return {"enabled": False, "items": []}
+    with _INFERENCE_LOG_LOCK:
+        index = _read_inference_log_index()
+        ids = index["items"]
+        if limit is not None:
+            ids = ids[: max(0, limit)]
+        items: List[Dict[str, Any]] = []
+        for inference_id in ids:
+            try:
+                meta = _read_inference_log_metadata(inference_id)
+            except Exception:
+                continue
+            items.append(
+                {
+                    "id": meta.get("id"),
+                    "created_at": meta.get("created_at"),
+                    "model_tag": meta.get("model_tag"),
+                    "model_name": meta.get("model_name"),
+                    "age": meta.get("age"),
+                    "std": meta.get("std"),
+                }
+            )
+        return {
+            "enabled": True,
+            "max_items": max(1, INFERENCE_LOG_MAX_ITEMS),
+            "count": len(items),
+            "items": items,
+        }
+
+
+def _get_inference_log_payload(inference_id: str, include_image: bool = False) -> Dict[str, Any]:
+    if not SAVE_INFERENCE_LOGS:
+        raise ValueError("Inference log storage is disabled.")
+    with _INFERENCE_LOG_LOCK:
+        meta = _read_inference_log_metadata(inference_id)
+        if include_image:
+            image_path = str(meta.get("image_path", ""))
+            if not image_path or not os.path.exists(image_path):
+                raise ValueError(f"Image not found for inference_id: {inference_id}")
+            with open(image_path, "rb") as handle:
+                meta["image_base64"] = base64.b64encode(handle.read()).decode("utf-8")
+        return meta
 
 
 def _fetch_releases() -> List[Dict[str, Any]]:
@@ -665,11 +797,19 @@ def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
     outputs = session.run(None, {input_name: tensor})
     mean_val, log_var_val = _extract_mean_logvar(outputs)
     std_val = float(np.exp(0.5 * log_var_val))
+    inference_id = _save_inference_log(
+        img=img,
+        model_tag=selected_tag,
+        model_name=selected_model_name,
+        age=mean_val,
+        std=std_val,
+    )
     return {
         "age": mean_val,
         "std": std_val,
         "model_tag": selected_tag,
         "model_name": selected_model_name,
+        "inference_id": inference_id,
     }
 
 
@@ -685,6 +825,19 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
             if not tag:
                 raise ValueError("Missing required field: model_tag")
             return _get_model_payload(tag)
+        if action == "list_inference_logs":
+            limit_raw = job_input.get("limit")
+            limit = int(limit_raw) if limit_raw is not None else None
+            return _list_inference_logs_payload(limit=limit)
+        if action == "get_inference_log":
+            inference_id = str(job_input.get("inference_id", "")).strip()
+            if not inference_id:
+                raise ValueError("Missing required field: inference_id")
+            include_image = bool(job_input.get("include_image", False))
+            return _get_inference_log_payload(
+                inference_id=inference_id,
+                include_image=include_image,
+            )
 
         return _run_inference(job_input)
     except Exception as exc:
@@ -745,6 +898,42 @@ class _LocalHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json(404, {"error": str(exc)})
             return
+        if path == "/inference-logs":
+            self._send_json(200, _list_inference_logs_payload())
+            return
+        if path.startswith("/inference-logs/"):
+            parts = path.split("/")
+            if len(parts) >= 3:
+                inference_id = parts[2]
+                if len(parts) >= 4 and parts[3] == "image":
+                    try:
+                        payload = _get_inference_log_payload(
+                            inference_id=inference_id,
+                            include_image=False,
+                        )
+                        image_path = str(payload.get("image_path", ""))
+                        if not image_path or not os.path.exists(image_path):
+                            self._send_json(404, {"error": "Image not found"})
+                            return
+                        with open(image_path, "rb") as handle:
+                            raw = handle.read()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                    except Exception as exc:
+                        self._send_json(404, {"error": str(exc)})
+                    return
+                try:
+                    payload = _get_inference_log_payload(
+                        inference_id=inference_id,
+                        include_image=False,
+                    )
+                    self._send_json(200, payload)
+                except Exception as exc:
+                    self._send_json(404, {"error": str(exc)})
+                return
         self.send_error(404, "Not Found")
 
     def do_POST(self) -> None:
