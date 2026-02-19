@@ -664,6 +664,22 @@ def _decode_image(job_input: Dict[str, Any]) -> Image.Image:
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
 def _prepare_image(img: Image.Image, size: int) -> np.ndarray:
     width, height = img.size
     crop = min(width, height)
@@ -782,14 +798,22 @@ def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
     img = _decode_image(job_input)
     rgb_image = np.array(img)
 
-    landmarker = _load_hand_landmarker()
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
-    result = landmarker.detect(mp_image)
-    hands = _extract_hands(result, img.width, img.height)
+    use_hand_landmarks = _coerce_bool(job_input.get("use_hand_landmarks"), default=True)
+    use_hand_masking = _coerce_bool(job_input.get("use_hand_masking"), default=True)
+    if use_hand_masking and not use_hand_landmarks:
+        raise ValueError("use_hand_masking=true requires use_hand_landmarks=true")
 
-    mask = _segment_hands(rgb_image, hands)
-    if hands and np.any(mask):
-        rgb_image = _apply_mask(rgb_image, mask)
+    hands: List[Dict[str, Any]] = []
+    if use_hand_landmarks:
+        landmarker = _load_hand_landmarker()
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+        result = landmarker.detect(mp_image)
+        hands = _extract_hands(result, img.width, img.height)
+
+    if use_hand_masking:
+        mask = _segment_hands(rgb_image, hands)
+        if hands and np.any(mask):
+            rgb_image = _apply_mask(rgb_image, mask)
 
     masked_img = Image.fromarray(rgb_image)
     _maybe_save_image(masked_img)
@@ -810,6 +834,8 @@ def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
         "model_tag": selected_tag,
         "model_name": selected_model_name,
         "inference_id": inference_id,
+        "use_hand_landmarks": use_hand_landmarks,
+        "use_hand_masking": use_hand_masking,
     }
 
 

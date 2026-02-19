@@ -76,6 +76,13 @@ curl -s -X POST http://localhost:8000/ \
   -d '{"input":{"image_base64":"<BASE64_OR_DATA_URL>","model_tag":"v2_m"}}'
 ```
 
+Infer with preprocessing flags:
+```bash
+curl -s -X POST http://localhost:8000/ \
+  -H "Content-Type: application/json" \
+  -d '{"input":{"image_base64":"<BASE64_OR_DATA_URL>","model_tag":"v2_m","use_hand_landmarks":true,"use_hand_masking":true}}'
+```
+
 List saved inference logs:
 ```bash
 curl -s http://localhost:8000/inference-logs
@@ -115,6 +122,14 @@ curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <RUNPOD_API_KEY>" \
   -d '{"input":{"image_base64":"<BASE64_OR_DATA_URL>","model_tag":"v2_m"}}'
+```
+
+Infer and control preprocessing:
+```bash
+curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <RUNPOD_API_KEY>" \
+  -d '{"input":{"image_base64":"<BASE64_OR_DATA_URL>","model_tag":"v2_m","use_hand_landmarks":true,"use_hand_masking":false}}'
 ```
 
 List saved inference logs:
