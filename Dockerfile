@@ -18,6 +18,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip \
         onnxruntime-gpu \
         opencv-python-headless \
         Pillow \
+        boto3 \
         runpod \
         timm \
     && python3 -m pip install --no-cache-dir \

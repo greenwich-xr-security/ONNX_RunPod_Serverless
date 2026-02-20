@@ -10,7 +10,7 @@ The worker supports:
 - inference (`action=infer`, default),
 - model catalog listing from GitHub Releases (`action=list_models`),
 - model detail lookup (`action=get_model`),
-- bounded inference log storage/listing (`action=list_inference_logs`, `action=get_inference_log`).
+- inference log storage/listing (`action=list_inference_logs`, `action=get_inference_log`).
 
 Release sync runs on demand during model-catalog requests, not at worker startup.
 
@@ -36,12 +36,36 @@ Build (legacy pre-bake models into image):
 docker build -t age-inference-runpod --build-arg DOWNLOAD_MODELS=1 .
 ```
 
-Run with release-sync mode:
+Run with release-sync mode + S3 inference logs:
 ```bash
 docker run --gpus all -p 8000:8000 \
   -e MODEL_REPO_OWNER=<OWNER> \
   -e MODEL_REPO_NAME=<REPO> \
   -e GITHUB_TOKEN=<TOKEN_IF_PRIVATE> \
+  -e SAVE_INFERENCE_LOGS=1 \
+  -e INFERENCE_LOG_STORAGE=s3 \
+  -e INFERENCE_LOG_S3_BUCKET=<S3_BUCKET> \
+  -e INFERENCE_LOG_S3_ENDPOINT_URL=<S3_ENDPOINT_URL> \
+  -e INFERENCE_LOG_S3_REGION=<S3_REGION> \
+  -e INFERENCE_LOG_S3_ACCESS_KEY_ID=<S3_ACCESS_KEY_ID> \
+  -e INFERENCE_LOG_S3_SECRET_ACCESS_KEY=<S3_SECRET_ACCESS_KEY> \
+  age-inference-runpod
+```
+
+Windows PowerShell local workflow:
+```powershell
+. .\.vscode\set-env.local.ps1
+docker run --gpus all -p 8000:8000 `
+  -e MODEL_REPO_OWNER=$env:MODEL_REPO_OWNER `
+  -e MODEL_REPO_NAME=$env:MODEL_REPO_NAME `
+  -e GITHUB_TOKEN=$env:GITHUB_TOKEN `
+  -e SAVE_INFERENCE_LOGS=1 `
+  -e INFERENCE_LOG_STORAGE=s3 `
+  -e INFERENCE_LOG_S3_BUCKET=$env:INFERENCE_LOG_S3_BUCKET `
+  -e INFERENCE_LOG_S3_ENDPOINT_URL=$env:INFERENCE_LOG_S3_ENDPOINT_URL `
+  -e INFERENCE_LOG_S3_REGION=$env:INFERENCE_LOG_S3_REGION `
+  -e INFERENCE_LOG_S3_ACCESS_KEY_ID=$env:INFERENCE_LOG_S3_ACCESS_KEY_ID `
+  -e INFERENCE_LOG_S3_SECRET_ACCESS_KEY=$env:INFERENCE_LOG_S3_SECRET_ACCESS_KEY `
   age-inference-runpod
 ```
 
@@ -185,6 +209,16 @@ Segmentation stack:
 
 Inference logs:
 - `SAVE_INFERENCE_LOGS=1`: enable saving inference input/output pairs.
-- `INFERENCE_LOG_MAX_ITEMS`: max saved pairs, oldest deleted first (default `100`).
-- `INFERENCE_LOG_DIR`: directory for inference logs (default `/app/inference_logs`).
+- `INFERENCE_LOG_STORAGE`: must be `s3` (default `s3`).
 - `INFERENCE_LOG_JPEG_QUALITY`: JPEG quality for saved inputs (default `90`).
+- `INFERENCE_LOG_S3_BUCKET`: S3 bucket name for logs (required for S3 mode).
+- `INFERENCE_LOG_S3_PREFIX`: key prefix inside bucket (default `inference_logs`).
+- `INFERENCE_LOG_S3_ENDPOINT_URL`: S3-compatible endpoint URL (for RunPod volume S3 API).
+- `INFERENCE_LOG_S3_REGION`: region for S3 client signing (default `us-east-1`).
+- `INFERENCE_LOG_S3_ACCESS_KEY_ID`: optional explicit access key.
+- `INFERENCE_LOG_S3_SECRET_ACCESS_KEY`: optional explicit secret key.
+
+The worker writes:
+- `<prefix>/index.json`
+- `<prefix>/<INFERENCE_ID>.json`
+- `<prefix>/<INFERENCE_ID>.jpg`

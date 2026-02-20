@@ -72,9 +72,20 @@ MODEL_ALLOW_DRAFT = os.environ.get("MODEL_ALLOW_DRAFT", "0") == "1"
 MODEL_SYNC_MIN_INTERVAL_SEC = int(os.environ.get("MODEL_SYNC_MIN_INTERVAL_SEC", "300"))
 
 SAVE_INFERENCE_LOGS = os.environ.get("SAVE_INFERENCE_LOGS", "0") == "1"
-INFERENCE_LOG_MAX_ITEMS = int(os.environ.get("INFERENCE_LOG_MAX_ITEMS", "100"))
-INFERENCE_LOG_DIR = os.environ.get("INFERENCE_LOG_DIR", "/app/inference_logs")
 INFERENCE_LOG_JPEG_QUALITY = int(os.environ.get("INFERENCE_LOG_JPEG_QUALITY", "90"))
+INFERENCE_LOG_STORAGE = os.environ.get("INFERENCE_LOG_STORAGE", "s3").strip().lower()
+INFERENCE_LOG_S3_BUCKET = os.environ.get("INFERENCE_LOG_S3_BUCKET", "").strip()
+INFERENCE_LOG_S3_PREFIX = os.environ.get("INFERENCE_LOG_S3_PREFIX", "inference_logs").strip(
+    "/"
+)
+INFERENCE_LOG_S3_ENDPOINT_URL = os.environ.get("INFERENCE_LOG_S3_ENDPOINT_URL", "").strip()
+INFERENCE_LOG_S3_REGION = os.environ.get("INFERENCE_LOG_S3_REGION", "us-east-1").strip()
+INFERENCE_LOG_S3_ACCESS_KEY_ID = os.environ.get(
+    "INFERENCE_LOG_S3_ACCESS_KEY_ID", ""
+).strip()
+INFERENCE_LOG_S3_SECRET_ACCESS_KEY = os.environ.get(
+    "INFERENCE_LOG_S3_SECRET_ACCESS_KEY", ""
+).strip()
 MAX_HANDS = int(os.environ.get("MAX_HANDS", "2"))
 MIN_HAND_DET_CONF = float(os.environ.get("MIN_HAND_DET_CONF", "0.5"))
 MIN_HAND_PRESENCE_CONF = float(os.environ.get("MIN_HAND_PRESENCE_CONF", "0.5"))
@@ -91,12 +102,12 @@ _MODEL_CATALOG_CACHE: Dict[str, Any] | None = None
 _MODEL_CATALOG_LOCK = threading.Lock()
 _MODEL_CATALOG_LAST_SYNC = 0.0
 _INFERENCE_LOG_LOCK = threading.Lock()
+_INFERENCE_S3_CLIENT: Any | None = None
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 DEFAULT_INPUT_SIZE = 480
 GITHUB_API_BASE = "https://api.github.com"
-INFERENCE_LOG_INDEX_PATH = os.path.join(INFERENCE_LOG_DIR, "index.json")
 
 
 def _now_iso() -> str:
@@ -233,11 +244,133 @@ def _write_manifest(manifest: Dict[str, Any]) -> None:
     os.replace(tmp_path, MODEL_MANIFEST_PATH)
 
 
+def _is_runpod_runtime_env() -> bool:
+    if os.environ.get("FORCE_RUNPOD_SERVERLESS") == "1":
+        return True
+    if os.environ.get("RUNPOD_SERVERLESS") == "1":
+        return True
+    if os.environ.get("RUNPOD_ENDPOINT_ID"):
+        return True
+    if os.environ.get("RUNPOD_API_KEY"):
+        return True
+    return False
+
+
+def _inference_log_storage_mode() -> str:
+    if INFERENCE_LOG_STORAGE != "s3":
+        raise ValueError("INFERENCE_LOG_STORAGE must be set to: s3")
+    return "s3"
+
+
+def _inference_log_s3_key(name: str) -> str:
+    if INFERENCE_LOG_S3_PREFIX:
+        return f"{INFERENCE_LOG_S3_PREFIX}/{name}"
+    return name
+
+
+def _inference_log_index_ref() -> str:
+    _inference_log_storage_mode()
+    return _inference_log_s3_key("index.json")
+
+
+def _get_inference_s3_client() -> Any:
+    global _INFERENCE_S3_CLIENT
+    if _INFERENCE_S3_CLIENT is not None:
+        return _INFERENCE_S3_CLIENT
+    if not INFERENCE_LOG_S3_BUCKET:
+        raise ValueError("INFERENCE_LOG_S3_BUCKET is required for S3 log storage.")
+
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError("boto3 is required for S3 inference log storage.") from exc
+
+    kwargs: Dict[str, Any] = {}
+    if INFERENCE_LOG_S3_ENDPOINT_URL:
+        kwargs["endpoint_url"] = INFERENCE_LOG_S3_ENDPOINT_URL
+    if INFERENCE_LOG_S3_REGION:
+        kwargs["region_name"] = INFERENCE_LOG_S3_REGION
+    if INFERENCE_LOG_S3_ACCESS_KEY_ID and INFERENCE_LOG_S3_SECRET_ACCESS_KEY:
+        kwargs["aws_access_key_id"] = INFERENCE_LOG_S3_ACCESS_KEY_ID
+        kwargs["aws_secret_access_key"] = INFERENCE_LOG_S3_SECRET_ACCESS_KEY
+
+    _INFERENCE_S3_CLIENT = boto3.client("s3", **kwargs)
+    return _INFERENCE_S3_CLIENT
+
+
+def _s3_get_object_bytes(key: str) -> bytes | None:
+    client = _get_inference_s3_client()
+    try:
+        response = client.get_object(Bucket=INFERENCE_LOG_S3_BUCKET, Key=key)
+        return response["Body"].read()
+    except Exception as exc:
+        response = getattr(exc, "response", {}) or {}
+        error = response.get("Error", {}) or {}
+        code = str(error.get("Code", "")).strip()
+        message = str(error.get("Message", "")).strip().lower()
+        status = str(response.get("ResponseMetadata", {}).get("HTTPStatusCode", "")).strip()
+
+        # Some S3-compatible providers return non-standard codes/messages for missing keys.
+        if (
+            code in {"NoSuchKey", "404", "NotFound", "InvalidArgument"}
+            and "not found" in message
+        ) or code in {"NoSuchKey", "404", "NotFound"} or status == "404":
+            return None
+        raise
+
+
+def _s3_put_object_bytes(key: str, raw: bytes, content_type: str) -> None:
+    client = _get_inference_s3_client()
+    client.put_object(
+        Bucket=INFERENCE_LOG_S3_BUCKET,
+        Key=key,
+        Body=raw,
+        ContentType=content_type,
+    )
+
+
+def _s3_delete_object(key: str) -> None:
+    client = _get_inference_s3_client()
+    client.delete_object(Bucket=INFERENCE_LOG_S3_BUCKET, Key=key)
+
+
+def _s3_list_objects(prefix: str) -> List[str]:
+    client = _get_inference_s3_client()
+    token: str | None = None
+    keys: List[str] = []
+    while True:
+        params: Dict[str, Any] = {"Bucket": INFERENCE_LOG_S3_BUCKET, "Prefix": prefix}
+        if token:
+            params["ContinuationToken"] = token
+        response = client.list_objects_v2(**params)
+        contents = response.get("Contents", []) or []
+        for item in contents:
+            key = item.get("Key")
+            if isinstance(key, str):
+                keys.append(key)
+        if not response.get("IsTruncated"):
+            break
+        token = response.get("NextContinuationToken")
+    return keys
+
+
 def _read_inference_log_index() -> Dict[str, Any]:
-    if not os.path.exists(INFERENCE_LOG_INDEX_PATH):
-        return {"items": []}
-    with open(INFERENCE_LOG_INDEX_PATH, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
+    _inference_log_storage_mode()
+    raw = _s3_get_object_bytes(_inference_log_index_ref())
+    if not raw:
+        prefix = _inference_log_s3_key("")
+        keys = _s3_list_objects(prefix)
+        index_key = _inference_log_index_ref()
+        ids: List[str] = []
+        for key in keys:
+            if key == index_key or not key.endswith(".json"):
+                continue
+            name = key.rsplit("/", 1)[-1]
+            ids.append(name[:-5])
+        ids.sort(reverse=True)
+        return {"items": ids}
+    data = json.loads(raw.decode("utf-8"))
+
     if not isinstance(data, dict):
         return {"items": []}
     items = data.get("items")
@@ -247,17 +380,19 @@ def _read_inference_log_index() -> Dict[str, Any]:
 
 
 def _write_inference_log_index(index: Dict[str, Any]) -> None:
-    _mkdir_for_file(INFERENCE_LOG_INDEX_PATH)
-    tmp_path = f"{INFERENCE_LOG_INDEX_PATH}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(index, handle, indent=2)
-    os.replace(tmp_path, INFERENCE_LOG_INDEX_PATH)
+    _inference_log_storage_mode()
+    _s3_put_object_bytes(
+        _inference_log_index_ref(),
+        json.dumps(index, indent=2).encode("utf-8"),
+        "application/json",
+    )
 
 
 def _inference_log_paths(inference_id: str) -> Tuple[str, str]:
-    image_path = os.path.join(INFERENCE_LOG_DIR, f"{inference_id}.jpg")
-    meta_path = os.path.join(INFERENCE_LOG_DIR, f"{inference_id}.json")
-    return image_path, meta_path
+    _inference_log_storage_mode()
+    image_ref = _inference_log_s3_key(f"{inference_id}.jpg")
+    meta_ref = _inference_log_s3_key(f"{inference_id}.json")
+    return image_ref, meta_ref
 
 
 def _save_inference_log(
@@ -269,8 +404,9 @@ def _save_inference_log(
 ) -> str | None:
     if not SAVE_INFERENCE_LOGS:
         return None
+    _inference_log_storage_mode()
     inference_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
-    image_path, meta_path = _inference_log_paths(inference_id)
+    image_ref, meta_ref = _inference_log_paths(inference_id)
     metadata = {
         "id": inference_id,
         "created_at": _now_iso(),
@@ -278,38 +414,48 @@ def _save_inference_log(
         "model_name": model_name,
         "age": age,
         "std": std,
-        "image_path": image_path,
-        "metadata_path": meta_path,
+        "storage": "s3",
+        "image_key": image_ref,
+        "metadata_key": meta_ref,
     }
 
     with _INFERENCE_LOG_LOCK:
-        os.makedirs(INFERENCE_LOG_DIR, exist_ok=True)
-        img.convert("RGB").save(image_path, format="JPEG", quality=INFERENCE_LOG_JPEG_QUALITY)
-        with open(meta_path, "w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, indent=2)
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=INFERENCE_LOG_JPEG_QUALITY)
+        _s3_put_object_bytes(image_ref, buf.getvalue(), "image/jpeg")
+        _s3_put_object_bytes(
+            meta_ref,
+            json.dumps(metadata, indent=2).encode("utf-8"),
+            "application/json",
+        )
 
         index = _read_inference_log_index()
         items = [inference_id] + [item for item in index["items"] if item != inference_id]
-
-        max_items = max(1, INFERENCE_LOG_MAX_ITEMS)
-        stale_ids = items[max_items:]
-        for stale_id in stale_ids:
-            stale_image_path, stale_meta_path = _inference_log_paths(stale_id)
-            if os.path.exists(stale_image_path):
-                os.remove(stale_image_path)
-            if os.path.exists(stale_meta_path):
-                os.remove(stale_meta_path)
-        index["items"] = items[:max_items]
+        index["items"] = items
         _write_inference_log_index(index)
     return inference_id
 
 
 def _read_inference_log_metadata(inference_id: str) -> Dict[str, Any]:
-    _image_path, meta_path = _inference_log_paths(inference_id)
-    if not os.path.exists(meta_path):
+    _inference_log_storage_mode()
+    _image_ref, meta_ref = _inference_log_paths(inference_id)
+    raw = _s3_get_object_bytes(meta_ref)
+    if not raw:
         raise ValueError(f"Unknown inference_id: {inference_id}")
-    with open(meta_path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    return json.loads(raw.decode("utf-8"))
+
+
+def _read_inference_log_image_bytes(inference_id: str, meta: Dict[str, Any]) -> bytes:
+    _inference_log_storage_mode()
+    image_key = str(meta.get("image_key", ""))
+    if not image_key:
+        image_key, _meta_key = _inference_log_paths(inference_id)
+    if not image_key:
+        raise ValueError(f"Image not found for inference_id: {inference_id}")
+    raw = _s3_get_object_bytes(image_key)
+    if not raw:
+        raise ValueError(f"Image not found for inference_id: {inference_id}")
+    return raw
 
 
 def _list_inference_logs_payload(limit: int | None = None) -> Dict[str, Any]:
@@ -338,7 +484,8 @@ def _list_inference_logs_payload(limit: int | None = None) -> Dict[str, Any]:
             )
         return {
             "enabled": True,
-            "max_items": max(1, INFERENCE_LOG_MAX_ITEMS),
+            "storage": "s3",
+            "index_ref": _inference_log_index_ref(),
             "count": len(items),
             "items": items,
         }
@@ -350,11 +497,8 @@ def _get_inference_log_payload(inference_id: str, include_image: bool = False) -
     with _INFERENCE_LOG_LOCK:
         meta = _read_inference_log_metadata(inference_id)
         if include_image:
-            image_path = str(meta.get("image_path", ""))
-            if not image_path or not os.path.exists(image_path):
-                raise ValueError(f"Image not found for inference_id: {inference_id}")
-            with open(image_path, "rb") as handle:
-                meta["image_base64"] = base64.b64encode(handle.read()).decode("utf-8")
+            raw = _read_inference_log_image_bytes(inference_id, meta)
+            meta["image_base64"] = base64.b64encode(raw).decode("utf-8")
         return meta
 
 
@@ -811,14 +955,20 @@ def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
     outputs = session.run(None, {input_name: tensor})
     mean_val, log_var_val = _extract_mean_logvar(outputs)
     std_val = float(np.exp(0.5 * log_var_val))
-    inference_id = _save_inference_log(
-        img=masked_img,
-        model_tag=selected_tag,
-        model_name=selected_model_name,
-        age=mean_val,
-        std=std_val,
-    )
-    return {
+    inference_id = None
+    inference_log_error = None
+    try:
+        inference_id = _save_inference_log(
+            img=masked_img,
+            model_tag=selected_tag,
+            model_name=selected_model_name,
+            age=mean_val,
+            std=std_val,
+        )
+    except Exception as exc:
+        inference_log_error = str(exc)
+
+    response = {
         "age": mean_val,
         "std": std_val,
         "model_tag": selected_tag,
@@ -827,6 +977,9 @@ def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
         "use_hand_landmarks": use_hand_landmarks,
         "use_hand_masking": use_hand_masking,
     }
+    if inference_log_error:
+        response["inference_log_error"] = inference_log_error
+    return response
 
 
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -861,15 +1014,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _should_use_runpod() -> bool:
-    if os.environ.get("FORCE_RUNPOD_SERVERLESS") == "1":
-        return True
-    if os.environ.get("RUNPOD_SERVERLESS") == "1":
-        return True
-    if os.environ.get("RUNPOD_ENDPOINT_ID"):
-        return True
-    if os.environ.get("RUNPOD_API_KEY"):
-        return True
-    return False
+    return _is_runpod_runtime_env()
 
 
 def _ensure_test_input() -> None:
@@ -927,12 +1072,7 @@ class _LocalHandler(BaseHTTPRequestHandler):
                             inference_id=inference_id,
                             include_image=False,
                         )
-                        image_path = str(payload.get("image_path", ""))
-                        if not image_path or not os.path.exists(image_path):
-                            self._send_json(404, {"error": "Image not found"})
-                            return
-                        with open(image_path, "rb") as handle:
-                            raw = handle.read()
+                        raw = _read_inference_log_image_bytes(inference_id, payload)
                         self.send_response(200)
                         self.send_header("Content-Type", "image/jpeg")
                         self.send_header("Content-Length", str(len(raw)))
