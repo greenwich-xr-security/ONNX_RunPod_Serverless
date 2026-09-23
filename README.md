@@ -8,6 +8,7 @@ Run a GPU-backed pipeline that:
 
 The worker supports:
 - inference (`action=infer`, default),
+- runtime/device health (`action=health`),
 - model catalog listing from GitHub Releases (`action=list_models`),
 - model detail lookup (`action=get_model`),
 - inference log storage/listing (`action=list_inference_logs`, `action=get_inference_log`).
@@ -71,10 +72,14 @@ docker run --gpus all -p 8000:8000 `
 
 ## Local HTTP API
 
-Health:
+Health (reports the execution providers actually in use):
 ```bash
 curl -s http://localhost:8000/health
 ```
+
+`onnx_providers` is empty until the first inference loads a session. If it comes
+back as `["CPUExecutionProvider"]` while `cuda_available` is `true`, the CUDA
+execution provider failed to load and the age regressor is running on CPU.
 
 List models:
 ```bash
@@ -123,6 +128,14 @@ curl -s http://localhost:8000/inference-logs/<INFERENCE_ID>/image --output input
 ```
 
 ## RunPod API Usage
+
+Check worker health/device:
+```bash
+curl -s https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <RUNPOD_API_KEY>" \
+  -d '{"input":{"action":"health"}}'
+```
 
 List models:
 ```bash

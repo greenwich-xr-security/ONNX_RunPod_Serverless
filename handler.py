@@ -97,6 +97,7 @@ _DEVICE: str | None = None
 
 _MODEL_SESSION_CACHE: Dict[str, Tuple[ort.InferenceSession, str, int]] = {}
 _MODEL_SESSION_LOCK = threading.Lock()
+_ONNX_PROVIDERS: List[str] = []
 
 _MODEL_CATALOG_CACHE: Dict[str, Any] | None = None
 _MODEL_CATALOG_LOCK = threading.Lock()
@@ -664,6 +665,16 @@ def _get_catalog_with_refresh() -> Dict[str, Any] | None:
     return _sync_model_catalog(force=False)
 
 
+def _health_payload() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "cuda_available": torch.cuda.is_available(),
+        "torch_device": _DEVICE,
+        "onnx_providers": _ONNX_PROVIDERS,
+        "onnx_available_providers": ort.get_available_providers(),
+    }
+
+
 def _list_models_payload() -> Dict[str, Any]:
     catalog = _get_catalog_with_refresh()
     if not catalog:
@@ -780,12 +791,20 @@ def _infer_img_size(session: ort.InferenceSession) -> int | None:
 
 
 def _load_age_model(model_path: str) -> Tuple[ort.InferenceSession, str, int]:
+    global _ONNX_PROVIDERS
     with _MODEL_SESSION_LOCK:
         cached = _MODEL_SESSION_CACHE.get(model_path)
         if cached is not None:
             return cached
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         session = ort.InferenceSession(model_path, providers=providers)
+        _ONNX_PROVIDERS = list(session.get_providers())
+        if "CUDAExecutionProvider" not in _ONNX_PROVIDERS and torch.cuda.is_available():
+            print(
+                "WARNING: a GPU is present but onnxruntime fell back to "
+                f"{_ONNX_PROVIDERS}; the age regressor is running on CPU.",
+                flush=True,
+            )
         input_name = session.get_inputs()[0].name
         input_size = _infer_img_size(session) or DEFAULT_INPUT_SIZE
         data = (session, input_name, input_size)
@@ -987,6 +1006,8 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         job_input = job.get("input", {})
         action = str(job_input.get("action", "infer")).lower()
 
+        if action == "health":
+            return _health_payload()
         if action == "list_models":
             return _list_models_payload()
         if action == "get_model":
@@ -1046,7 +1067,7 @@ class _LocalHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.rstrip("/")
         if path == "/health":
-            self._send_json(200, {"status": "ok"})
+            self._send_json(200, _health_payload())
             return
         if path == "/models":
             self._send_json(200, _list_models_payload())
