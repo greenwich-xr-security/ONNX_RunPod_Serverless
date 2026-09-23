@@ -5,6 +5,7 @@ RUN apt-get update \
         ca-certificates \
         curl \
         git \
+        libegl1 \
         libglib2.0-0 \
         libgl1 \
         python3 \
