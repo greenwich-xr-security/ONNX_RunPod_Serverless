@@ -2,9 +2,13 @@
 
 Run a GPU-backed pipeline that:
 1) detects hand joints with MediaPipe HandLandmarker,
-2) feeds those joint points into MobileSAM's SAM predictor (vit_t, TinyViT backbone),
-3) masks the input image to the hand region, and
-4) runs an ONNX age regressor.
+2) selects the largest valid detected hand,
+3) feeds that hand's joint points into MobileSAM's SAM predictor (vit_t, TinyViT backbone),
+4) masks the input image to the hand region,
+5) centres a square crop on the hand-joint bounding box, and
+6) runs an ONNX age regressor.
+
+When landmark-enabled inference cannot identify a valid set of 21 hand joints, it skips masking and ONNX inference and returns the existing response structure with `"age": -1.0` and `"std": 0.0`. No additional validity fields are added.
 
 The worker supports:
 - inference (`action=infer`, default),
@@ -107,6 +111,21 @@ curl -s -X POST http://localhost:8000/ \
   -d '{"input":{"image_base64":"<BASE64_OR_DATA_URL>","model_tag":"v2_m","use_hand_landmarks":true,"use_hand_masking":true}}'
 ```
 
+With `use_hand_landmarks=true` (the default), the selected hand is centred using a square around its landmark bounding box. The default crop reserves a 5% border on every side, so the longest landmark span occupies at most 90% of the final crop. If more than one valid hand is detected, the hand with the largest landmark bounding-box area is used. Setting both `use_hand_landmarks=false` and `use_hand_masking=false` retains the legacy whole-frame centre crop.
+
+No-hand response (same response contract):
+```json
+{
+  "age": -1.0,
+  "std": 0.0,
+  "model_tag": "v2_m",
+  "model_name": "<MODEL_NAME>",
+  "inference_id": null,
+  "use_hand_landmarks": true,
+  "use_hand_masking": true
+}
+```
+
 List saved inference logs:
 ```bash
 curl -s http://localhost:8000/inference-logs
@@ -204,6 +223,7 @@ Segmentation stack:
 - `MIN_HAND_DET_CONF`: minimum detection confidence (default `0.5`).
 - `MIN_HAND_PRESENCE_CONF`: minimum presence confidence (default `0.5`).
 - `MIN_HAND_TRACKING_CONF`: minimum tracking confidence (default `0.5`).
+- `HAND_CROP_BORDER_RATIO`: empty border reserved on each side of the centred hand crop (default `0.05`; must be at least `0.0` and less than `0.5`).
 - `SAVE_MASKED_IMAGE=1`: save masked image (overwrites each request).
 - `SAVE_MASKED_PATH`: path for masked image.
 

@@ -19,7 +19,7 @@ import onnxruntime as ort
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from mobile_sam import SamPredictor, sam_model_registry
-from PIL import Image
+from PIL import Image, ImageOps
 import runpod
 import torch
 
@@ -90,6 +90,9 @@ MAX_HANDS = int(os.environ.get("MAX_HANDS", "2"))
 MIN_HAND_DET_CONF = float(os.environ.get("MIN_HAND_DET_CONF", "0.5"))
 MIN_HAND_PRESENCE_CONF = float(os.environ.get("MIN_HAND_PRESENCE_CONF", "0.5"))
 MIN_HAND_TRACKING_CONF = float(os.environ.get("MIN_HAND_TRACKING_CONF", "0.5"))
+HAND_CROP_BORDER_RATIO = float(os.environ.get("HAND_CROP_BORDER_RATIO", "0.05"))
+if not 0.0 <= HAND_CROP_BORDER_RATIO < 0.5:
+    raise ValueError("HAND_CROP_BORDER_RATIO must be in the range [0.0, 0.5).")
 
 _HAND_LANDMARKER: vision.HandLandmarker | None = None
 _SAM_PREDICTOR: SamPredictor | None = None
@@ -822,12 +825,16 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     raise ValueError(f"Invalid boolean value: {value}")
 
 
-def _prepare_image(img: Image.Image, size: int) -> np.ndarray:
+def _center_crop_frame(img: Image.Image) -> Image.Image:
     width, height = img.size
     crop = min(width, height)
     left = (width - crop) // 2
     top = (height - crop) // 2
-    img = img.crop((left, top, left + crop, top + crop)).resize((size, size), Image.BILINEAR)
+    return img.crop((left, top, left + crop, top + crop))
+
+
+def _prepare_image(img: Image.Image, size: int) -> np.ndarray:
+    img = img.resize((size, size), Image.BILINEAR)
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
     arr = np.transpose(arr, (2, 0, 1))[None, ...]
@@ -857,11 +864,23 @@ def _extract_hands(
     result: vision.HandLandmarkerResult, width: int, height: int
 ) -> List[Dict[str, Any]]:
     hands: List[Dict[str, Any]] = []
+    max_x = max(width - 1, 0)
+    max_y = max(height - 1, 0)
     for idx, landmarks in enumerate(result.hand_landmarks or []):
         points = []
         for landmark in landmarks:
-            x = max(0.0, min(1.0, float(landmark.x))) * width
-            y = max(0.0, min(1.0, float(landmark.y))) * height
+            x_norm = float(landmark.x)
+            y_norm = float(landmark.y)
+            x = (
+                max(0.0, min(1.0, x_norm)) * max_x
+                if np.isfinite(x_norm)
+                else x_norm
+            )
+            y = (
+                max(0.0, min(1.0, y_norm)) * max_y
+                if np.isfinite(y_norm)
+                else y_norm
+            )
             points.append({"x": float(x), "y": float(y), "z": float(landmark.z)})
 
         handedness = None
@@ -875,6 +894,127 @@ def _extract_hands(
 
         hands.append({"points": points, "handedness": handedness, "score": score})
     return hands
+
+
+def _hand_bbox(
+    hand: Dict[str, Any], width: int, height: int
+) -> Tuple[int, int, int, int] | None:
+    if width <= 0 or height <= 0:
+        return None
+
+    points = hand.get("points")
+    if not isinstance(points, list) or len(points) != 21:
+        return None
+
+    xs: List[float] = []
+    ys: List[float] = []
+    max_x = float(width - 1)
+    max_y = float(height - 1)
+    for point in points:
+        if not isinstance(point, dict):
+            return None
+        try:
+            x = float(point["x"])
+            y = float(point["y"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not np.isfinite(x) or not np.isfinite(y):
+            return None
+        xs.append(max(0.0, min(max_x, x)))
+        ys.append(max(0.0, min(max_y, y)))
+
+    xmin = int(np.floor(min(xs)))
+    ymin = int(np.floor(min(ys)))
+    xmax = int(np.ceil(max(xs)))
+    ymax = int(np.ceil(max(ys)))
+    if xmax <= xmin or ymax <= ymin:
+        return None
+    return xmin, ymin, xmax, ymax
+
+
+def _select_primary_hand(
+    hands: List[Dict[str, Any]], width: int, height: int
+) -> Tuple[Dict[str, Any] | None, Tuple[int, int, int, int] | None]:
+    primary_hand = None
+    primary_bbox = None
+    primary_area = -1
+
+    for hand in hands:
+        bbox = _hand_bbox(hand, width, height)
+        if bbox is None:
+            continue
+        xmin, ymin, xmax, ymax = bbox
+        area = (xmax - xmin) * (ymax - ymin)
+        if area > primary_area:
+            primary_hand = hand
+            primary_bbox = bbox
+            primary_area = area
+
+    return primary_hand, primary_bbox
+
+
+def _make_square_bbox(
+    bbox: Tuple[int, int, int, int],
+    border_ratio: float = HAND_CROP_BORDER_RATIO,
+) -> Tuple[int, int, int, int]:
+    xmin, ymin, xmax, ymax = [int(value) for value in bbox]
+    if xmax <= xmin or ymax <= ymin:
+        raise ValueError(f"Invalid hand bounding box: {bbox}")
+    if not 0.0 <= border_ratio < 0.5:
+        raise ValueError("border_ratio must be in the range [0.0, 0.5).")
+
+    hand_side = max(xmax - xmin, ymax - ymin)
+    side = int(np.ceil(hand_side / (1.0 - 2.0 * border_ratio)))
+    center_x = (xmin + xmax) / 2.0
+    center_y = (ymin + ymax) / 2.0
+    square_xmin = int(np.floor(center_x - side / 2.0))
+    square_ymin = int(np.floor(center_y - side / 2.0))
+    return (
+        square_xmin,
+        square_ymin,
+        square_xmin + side,
+        square_ymin + side,
+    )
+
+
+def _crop_with_padding(
+    img: Image.Image, square_bbox: Tuple[int, int, int, int]
+) -> Image.Image:
+    square_xmin, square_ymin, square_xmax, square_ymax = square_bbox
+    if (
+        square_xmax <= square_xmin
+        or square_ymax <= square_ymin
+        or square_xmax - square_xmin != square_ymax - square_ymin
+    ):
+        raise ValueError(f"Invalid square bounding box: {square_bbox}")
+
+    width, height = img.size
+    pad_left = max(0, -square_xmin)
+    pad_top = max(0, -square_ymin)
+    pad_right = max(0, square_xmax - width)
+    pad_bottom = max(0, square_ymax - height)
+
+    if pad_left or pad_top or pad_right or pad_bottom:
+        img = ImageOps.expand(
+            img,
+            border=(pad_left, pad_top, pad_right, pad_bottom),
+            fill=(0, 0, 0),
+        )
+        square_xmin += pad_left
+        square_xmax += pad_left
+        square_ymin += pad_top
+        square_ymax += pad_top
+
+    square_xmin = max(0, square_xmin)
+    square_ymin = max(0, square_ymin)
+    square_xmax = max(square_xmin + 1, min(img.size[0], square_xmax))
+    square_ymax = max(square_ymin + 1, min(img.size[1], square_ymax))
+    cropped = img.crop((square_xmin, square_ymin, square_xmax, square_ymax))
+    if cropped.width != cropped.height:
+        raise RuntimeError(
+            f"Hand-centred crop is not square: {cropped.width}x{cropped.height}"
+        )
+    return cropped
 
 
 def _segment_hands(
@@ -929,7 +1069,6 @@ def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
         model_name=model_name,
     )
 
-    session, input_name, input_size = _load_age_model(model_path)
     img = _decode_image(job_input)
     rgb_image = np.array(img)
 
@@ -939,19 +1078,43 @@ def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("use_hand_masking=true requires use_hand_landmarks=true")
 
     hands: List[Dict[str, Any]] = []
+    primary_hand = None
+    primary_bbox = None
     if use_hand_landmarks:
         landmarker = _load_hand_landmarker()
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
         result = landmarker.detect(mp_image)
         hands = _extract_hands(result, img.width, img.height)
+        primary_hand, primary_bbox = _select_primary_hand(
+            hands, img.width, img.height
+        )
+        if primary_hand is None or primary_bbox is None:
+            return {
+                "age": -1.0,
+                "std": 0.0,
+                "model_tag": selected_tag,
+                "model_name": selected_model_name,
+                "inference_id": None,
+                "use_hand_landmarks": use_hand_landmarks,
+                "use_hand_masking": use_hand_masking,
+            }
+        hands = [primary_hand]
 
     if use_hand_masking:
         mask = _segment_hands(rgb_image, hands)
         if hands and np.any(mask):
             rgb_image = _apply_mask(rgb_image, mask)
 
-    masked_img = Image.fromarray(rgb_image)
-    tensor = _prepare_image(masked_img, input_size)
+    processed_img = Image.fromarray(rgb_image)
+    if primary_bbox is not None:
+        processed_img = _crop_with_padding(
+            processed_img, _make_square_bbox(primary_bbox)
+        )
+    else:
+        processed_img = _center_crop_frame(processed_img)
+
+    session, input_name, input_size = _load_age_model(model_path)
+    tensor = _prepare_image(processed_img, input_size)
     outputs = session.run(None, {input_name: tensor})
     mean_val, log_var_val = _extract_mean_logvar(outputs)
     std_val = float(np.exp(0.5 * log_var_val))
@@ -959,7 +1122,7 @@ def _run_inference(job_input: Dict[str, Any]) -> Dict[str, Any]:
     inference_log_error = None
     try:
         inference_id = _save_inference_log(
-            img=masked_img,
+            img=processed_img,
             model_tag=selected_tag,
             model_name=selected_model_name,
             age=mean_val,
